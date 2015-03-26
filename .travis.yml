@@ -30,7 +30,7 @@ install:
   # Build in test-environment
   - conda create -q -n test-environment python=$TRAVIS_PYTHON_VERSION --file=ci/requirements-${TRAVIS_PYTHON_VERSION}.txt
   - source activate test-environment
-  - pip install coveralls
+  # - pip install coveralls
   - python setup.py install
 
 script:
@@ -39,7 +39,7 @@ script:
   - conda list
   - pip freeze
   - echo $PATH
-  - py.test --doctest-modules --pep8 coveralls -v --cov coveralls --cov-report term-missing
+  - py.test  # --doctest-modules --pep8 coveralls -v --cov coveralls --cov-report term-missing
 
-after_success:
-  - coveralls
+# after_success:
+#   - coveralls
