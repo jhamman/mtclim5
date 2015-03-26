@@ -8,7 +8,7 @@ from mtclim.mtclim import MtClim, atm_pres, svp, svp_slope, calc_pet
 
 @pytest.fixture()
 def short_daily_dataframe(scope='function'):
-    data = '''tmax tmin prcp
+    data = u'''tmax tmin prcp
 1915-01-01 31.650000 22.420000 1.32
 1915-01-02 31.709999 22.459999 5.24
 1915-01-03 32.080002 22.900000 0.00
