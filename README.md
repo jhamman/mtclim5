@@ -1,5 +1,6 @@
 MT-CLIM
 ======
+[![Build Status](https://magnum.travis-ci.com/jhamman/mtclim5.svg?token=HDQ39wL3BZ4kpDobfPmo)](https://magnum.travis-ci.com/jhamman/mtclim5) [![Code Health](https://landscape.io/github/jhamman/mtclim5/master/landscape.svg?style=flat&badge_auth_token=0dc0c3bdbadd472abd932444a84477db)](https://landscape.io/github/jhamman/mtclim5/master)
 **Mountain Climate Simulator**
 
 ## Summary
