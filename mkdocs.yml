@@ -1,0 +1,36 @@
+site_name: MTCLIM
+site_description: Mountain Climate Simulator
+site_author: Joe Hamman
+repo_url: https://github.com/jhamman/mtclim5
+site_url: http://mtclim.readthedocs.org/en/latest/
+theme: readthedocs
+
+pages:
+# Main pages
+- ['index.md', 'Home']
+
+# About MTCLIM papges
+- ['about/ModelOverview.md', 'About', 'Overview']
+- ['about/Tair.md', 'About', 'Air Temperature']
+- ['about/Precip.md', 'About', 'Precipitation']
+- ['about/Humidity.md', 'About', 'Humidity']
+- ['about/SWrad.md', 'About', 'SWrad']
+- ['about/LWrad.md', 'About', 'LWrad']
+- ['about/References.md', 'About', 'References']
+
+# User guide pages
+- ['user-guide/install.md', 'User Guide', 'Intalling MTCLIM']
+- ['user-guide/API.md', 'User Guide', 'MTCLIM API']
+- ['user-guide/Options.md', 'User Guide', 'Options']
+- ['user-guide/Parameters.md', 'User Guide', 'Parameters']
+
+# Model development
+- ['model-development/Contributing.md', 'Model Development', 'Model Development']
+- ['model-development/OpenSourcePhilosopy.md', 'Model Development', 'Open Source Philosophy']
+- ['model-development/Testing.md', 'Model Development', 'Testing']
+
+# Downloads
+- ['downloads/Datasets.md', 'Downloads', 'Datasets']
+- ['downloads/Code.md', 'Downloads', 'Code']
+
+copyright: 'Copyright &copy; 2015, <a href="www.hydro.washington.edu/">University of Washington Computational Hydrology Group</a>.'
