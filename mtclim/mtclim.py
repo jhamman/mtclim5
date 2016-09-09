@@ -18,80 +18,19 @@ mtclim: Mountain Climate Simulator
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
 import pandas as pd
 import numpy as np
+from scipy.optimize import minimize_scalar
 from warnings import warn
-
-
-constants = \
-    {'SECPERRAD': 13750.9871,  # seconds per radian of hour angle
-     'RADPERDAY': 0.017214,  # radians of Earth orbit per julian day
-     'RADPERDEG': 0.01745329,  # radians per degree
-     'MINDECL': -0.4092797,  # minimum declination (radians)
-     'DAYSOFF': 11.25,  # julian day offset of winter solstice
-     'SRADDT': 30.0,  # timestep for radiation routine (seconds)
-                      # Note:  Make sure that 3600 % SRADDT == 0
-     'MA': 28.9644e-3,  # (kg mol-1) molecular weight of air
-     'R': 8.3143,  # (m3 Pa mol-1 K-1) gas law constant
-     'G_STD': 9.80665,  # (m s-2) standard gravitational accel.
-     'P_STD': 101325.0,  # (Pa) standard pressure at 0. m elevation
-     'T_STD': 288.15,  # (K) standard temp at 0. m elevation
-     'CP': 1010.0,  # (J kg-1 K-1) specific heat of air
-     'LR_STD': 0.0065,  # (-K m-1) standard temperature lapse rate
-     # optical airmass by degrees
-     'OPTAM': np.array([2.90, 3.05, 3.21, 3.39, 3.69, 3.82, 4.07, 4.37,
-                       4.72, 5.12, 5.60, 6.18, 6.88, 7.77, 8.90, 10.39,
-                       12.44, 15.36, 19.79, 26.96, 30.00]),
-     'KELVIN': 273.15,
-     'EPS': 0.62196351,
-     }
-
-default_parameters = \
-    {'TDAYCOEF': 0.45,  # (dim) daylight air temperature coefficient
-
-     # parameters for the snowpack algorithm
-     'SNOW_TCRIT': -6.0,  # (deg C) critical temperature for snowmelt
-     'SNOW_TRATE': 0.042,  # (cm/degC/day) snowmelt rate
-
-     # parameters for the radiation algorithm
-     # (dim) stands for dimensionless values
-     'TBASE': 0.870,  # (dim) max inst. trans., 0m, nadir, dry atm
-     'ABASE': -6.1e-5,  # (1/Pa) vapor pressure effect on
-                        # transmittance
-     'C': 1.5,  # (dim) radiation parameter
-     'B0': 0.031,  # (dim) radiation parameter
-     'B1': 0.201,  # (dim) radiation parameter
-     'B2': 0.185,  # (dim) radiation parameter
-     'RAIN_SCALAR': 0.75,  # (dim) correction to trans. for rain day
-     'DIF_ALB': 0.6,  # (dim) diffuse albedo for horizon correction
-     'SC_INT': 1.32,  # (MJ/m2/day) snow correction intercept
-     'SC_SLOPE': 0.096,  # (MJ/m2/day/cm) snow correction slope
-     'site_elev': 0.,
-     'base_elev': 0.,
-     'tmax_lr': 0.0065,
-     'tmin_lr': 0.0065,
-     'site_isoh': None,
-     'base_isoh': None,
-     'site_lat': 0.,
-     'site_slope': 0.,
-     'site_aspect': 0.,
-     'site_east_horiz': 0.,
-     'site_west_horiz': 0.
-     }
-
-default_options = \
-    {'SW_PREC_THRESH': 0.,
-     'VP_ITER': 'VP_ITER_ALWAYS',
-     'MTCLIM_SWE_CORR': False,
-     'LW_CLOUD': 'LW_CLOUD_DEARDORFF',
-     'LW_TYPE': 'LW_PRATA'}
+from statsmodels.tools.eval_measures import rmse
+from .physics import svp, calc_pet, atm_pres
+from .share import default_parameters, default_options, constants
 
 
 class MtClim(object):
     '''The University of Montana Mountain Climate Simulator'''
 
-    def __init__(self, data=None, parameters=None, options=None):
+    def __init__(self, run=False, data=None, parameters=None, options=None):
         '''
         Initialize MtClim object.
 
@@ -99,7 +38,9 @@ class MtClim(object):
         ----------
         data : pandas.DataFrame, optional
             Input data: pandas DataFrame with at least `tmax`, `tmin`, and
-            `prec`. Timestep freq should be `D`.
+            `prcp`. Timestep freq should be `D`.
+        run : bool, optional.
+            Compute all values imediately (default: False)
         parameters : dict-like, optional
             Dictionary of parameters to use apart from the default parameters.
         options : dict-like, optional
@@ -107,46 +48,60 @@ class MtClim(object):
         '''
 
         # Set model parameters
-        self.parameters = default_parameters
+        self.params = default_parameters
         if parameters is not None:
-            for p, val in parameters.items():
-                if p in self.parameters:
-                    self.parameters[p] = val
-                else:
-                    raise ValueError(
-                        'Parameter: %s is not a valid parameter' % p)
+            self.params.update(parameters)
 
         # Set model options
         self.options = default_options
         if options is not None:
-            for p, val in options.items():
-                if p in self.options:
-                    self.options[p] = val
-                else:
-                    raise ValueError(
-                        'Option: %s is not a valid option' % p)
+            self.options.update(options)
 
-        # Initialize data attribute
+        # Initialize data attributes
+
         if data is not None:
-            self.set_data(data)
+            self.data = data
         else:
-            self.data = None
+            self.data = pd.DataFrame()
 
-    def set_data(self, data):
-        '''set data attribute
+        if run:
+            self.init()
+            self.run()
 
-        data : pandas.DataFrame
-            Input data: pandas DataFrame with at least `tmax`, `tmin`, and
-            `prec`. Timestep freq should be `D`.
-        '''
-        assert type(data) == pd.DataFrame
-        assert all([v in data for v in ['tmax', 'tmin', 'prcp']])
-        self.data = data.resample('D', how='mean')
-        self.ndays = (data.index[-1] - data.index[0]).days
+    def init(self):
+        self.tinystepspday = 86400 / constants['SRADDT']
+        self.tiny_radfract = np.zeros(shape=(366, self.tinystepspday),
+                                      dtype=np.float64)
+
+    def run(self):
+        self.calc_tair()
+        self.calc_prcp()
+        self.snowpack()
+        self.calc_srad_humidity_iterative()
+        self.calc_longwave()
+
+    def resample(self):
+        return
+
+    @property
+    def data(self):
+        '''The objects DataFrame'''
+        return self._data
+
+    @data.setter
+    def data(self, df):
+        if not isinstance(df, pd.DataFrame):
+            raise TypeError(
+                'data must be a Pandas DataFrame instance, got %s' % type(df))
+        if not all([v in df for v in ['tmax', 'tmin', 'prcp']]):
+            raise ValueError('data must include tmax, tmin, and prcp')
+
+        self._data = df.resample('D').mean()
+        self.ndays = len(self._data)
 
     def __repr__(self):
         r = 'MtClim object\nparameters: {0}\noptions: {1}\ndata: {2}'.format(
-            self.parameters, self.options, self.data.head())
+            self.params, self.options, self.data.head())
         return r
 
     def __str__(self):
@@ -157,54 +112,43 @@ class MtClim(object):
         Calculates daily air temperatures.
         '''
         # calculate elevation difference in meters
-        dz = (self.parameters['site_elev'] -
-              self.parameters['base_elev'])
+        dz = (self.params['site_elev'] -
+              self.params['base_elev'])
 
         # apply lapse rate corrections to tmax and tmin
+        self.data['s_tmax'] = self.data['tmax'] + \
+            (dz * self.params['tmax_lr'])
+        self.data['s_tmin'] = self.data['tmin'] + \
+            (dz * self.params['tmin_lr'])
 
         # Since tmax lapse rate usually has a larger absolute value than tmin
         # lapse rate, it is possible at high elevation sites for these
         # corrections to result in tmin > tmax. Check for that occurrence and
         # force tmin = corrected tmax - 0.5 deg C.
-        self.data['s_tmax'] = self.data['tmax'] + \
-            (dz * self.parameters['tmax_lr'])
-        self.data['s_tmin'] = self.data['tmin'] + \
-            (dz * self.parameters['tmin_lr'])
-
-        self.data['s_tmin'] = np.minimum(self.data['s_tmin'],
-                                         self.data['s_tmax'] - 0.5)
+        self.data['s_tmin'].where(self.data['s_tmin'] > self.data['s_tmax'],
+                                  other=self.data['s_tmax'] - 0.5,
+                                  inplace=True)
 
         # derived temperatures
         tmean = self.data[['s_tmax', 's_tmin']].mean(axis=1)
         self.data['s_tday'] = ((self.data['s_tmax'] - tmean) *
-                               self.parameters['TDAYCOEF']) + tmean
+                               self.params['TDAYCOEF']) + tmean
 
     def calc_prcp(self):
         '''
         Calculates daily total precipitation
-
-        Tests to write:
-        - catch TypeError when isohs are None.
-        - no change when isohs are not set
         '''
-        self.data['s_prcp'] = self.data['prcp']
-        try:
-            self.data['s_prcp'] *= (self.parameters['site_isoh'] /
-                                    self.parameters['base_isoh'])
-        except TypeError:
-            if (self.parameters['site_isoh'] is None and
-                    self.parameters['base_isoh'] is None):
-                pass
-            else:
-                raise ValueError('Only one of base_isoh and site_isoh is set.')
+        if (self.params['site_isoh'] is not None and
+                self.params['base_isoh'] is not None):
+            factor = self.params['site_isoh'] / self.params['base_isoh']
+            self.data['s_prcp'] = self.data['prcp'] * factor
+        else:
+            self.data['s_prcp'] = self.data['prcp']
 
     def snowpack(self):
         '''
         estimates the accumulation and melt of snow for radiation algorithm
         corrections
-
-        Tests to write:
-        - runs to completion
         '''
         # initialize SWE array
         self.data['s_swe'] = 0.
@@ -232,28 +176,27 @@ class MtClim(object):
 
     def _simple_snowpack(self, snowpack):
         '''
-        Tests to write:
-        - runs to completion
-        - different results when snowpack starts is 0/nonzero
         '''
         for i in range(self.ndays):
-            if (self.data['s_tmin'][i] <= self.parameters['SNOW_TCRIT']):
+            if (self.data['s_tmin'][i] <= self.params['SNOW_TCRIT']):
                 snowpack += self.data['s_prcp'][i]
             else:
-                snowpack -= self.parameters['SNOW_TRATE'] * \
-                    (self.data['s_tmin'][i] - self.parameters['SNOW_TCRIT'])
+                snowpack -= self.params['SNOW_TRATE'] * \
+                    (self.data['s_tmin'][i] - self.params['SNOW_TCRIT'])
             snowpack = np.maximum(snowpack, 0.)
             self.data['s_swe'][i] = snowpack
 
     def calc_srad_humidity_iterative(self, tol=0.01, win_type='boxcar'):
         '''
-        Iterative estimation of shortwave radiation and humidity'''
+        Iterative estimation of shortwave radiation and humidity
+
+        TODO: simplify
+        '''
         ndays = self.ndays
 
         daylength = np.zeros(366)
         window = np.zeros(ndays + 90)
-        tinystepspday = 86400 / constants['SRADDT']
-        tiny_radfract = np.zeros((366, tinystepspday))
+
         ttmax0 = np.zeros(366)
         flat_potrad = np.zeros(366)
         slope_potrad = np.zeros(366)
@@ -331,12 +274,10 @@ class MtClim(object):
                     sum_prcp += window[i + j]
                     sum_prcp = (sum_prcp / 90.) * 365.25
 
-                # if the effective annual precip for this 90-day period
-                # is less than 8 cm, set the effective annual precip to 8 cm
-                # to reflect an arid condition, while avoiding possible
-                # division-by-zero errors and very large ratios (PET/Pann)
-                if sum_prcp < 8.:
-                    parray[i] = sum_prcp
+            # if the effective annual precip for this 90-day period
+            # is less than 8 cm, set the effective annual precip to 8 cm
+            # to reflect an arid condition, while avoiding possible
+            # division-by-zero errors and very large ratios (PET/Pann)
 
         # start of the main radiation algorithm
 
@@ -344,37 +285,25 @@ class MtClim(object):
         # radiation, calculate all the variables that don't depend on
         # humidity so they only get done once.
 
-        # STEP (1) calculate pressure ratio (site/reference) = f(elevation)
-        t1 = 1.0 - (constants['LR_STD'] * self.parameters['site_elev']) / \
-            constants['T_STD']
-        t2 = constants['G_STD'] / (constants['LR_STD'] *
-                                   (constants['R'] / constants['MA']))
-        pratio = np.power(t1, t2)
-
-        # STEP (2) correct initial transmittance for elevation
-        trans1 = np.power(self.parameters['TBASE'], pratio)
+        trans1 = self._calc_trans()
 
         # STEP (3) build 366-day array of ttmax0, potential rad, and daylength
         # precalculate the transcendentals
-        lat = self.parameters['site_lat']
         # check for (+/-) 90 degrees latitude, throws off daylength calc
-        lat *= constants['RADPERDEG']
-        if (lat > np.pi / 2.):
-            lat = np.pi / 2.
-        if (lat < -np.pi / 2.):
-            lat = -np.pi / 2.
+        lat = np.clip(self.params['site_lat'] * constants['RADPERDEG'],
+                      -np.pi / 2., np.pi / 2.)
         coslat = np.cos(lat)
         sinlat = np.sin(lat)
-        cosslp = np.cos(self.parameters['site_slope'] * constants['RADPERDEG'])
-        sinslp = np.sin(self.parameters['site_slope'] * constants['RADPERDEG'])
-        cosasp = np.cos(self.parameters['site_aspect'] *
+        cosslp = np.cos(self.params['site_slope'] * constants['RADPERDEG'])
+        sinslp = np.sin(self.params['site_slope'] * constants['RADPERDEG'])
+        cosasp = np.cos(self.params['site_aspect'] *
                         constants['RADPERDEG'])
-        sinasp = np.sin(self.parameters['site_aspect'] *
+        sinasp = np.sin(self.params['site_aspect'] *
                         constants['RADPERDEG'])
         # cosine of zenith angle for east and west horizons
-        coszeh = np.cos(np.pi / 2. - (self.parameters['site_east_horiz'] *
+        coszeh = np.cos(np.pi / 2. - (self.params['site_east_horiz'] *
                                       constants['RADPERDEG']))
-        coszwh = np.cos(np.pi / 2. - (self.parameters['site_west_horiz'] *
+        coszwh = np.cos(np.pi / 2. - (self.params['site_west_horiz'] *
                                       constants['RADPERDEG']))
 
         # sub-daily time and angular increment information
@@ -397,17 +326,12 @@ class MtClim(object):
             # calculate daylength as a function of lat and decl
             cosegeom = coslat * cosdecl
             sinegeom = sinlat * sindecl
-            coshss = -(sinegeom) / cosegeom
-            if (coshss < -1.0):
-                coshss = -1.0  # 24-hr daylight
-            if (coshss > 1.0):
-                coshss = 1.0  # 0-hr daylight
+            coshss = np.clip(-sinegeom / cosegeom, -1, 1)
+
             hss = np.cos(coshss)  # hour angle at sunset (radians)
             # daylength (seconds)
-            daylength[i] = 2.0 * hss * constants['SECPERRAD']
-
-            if (daylength[i] > 86400):
-                daylength[i] = 86400
+            daylength[i] = np.maximum(2.0 * hss * constants['SECPERRAD'],
+                                      86400)
 
             # solar constant as a function of yearday (W/m^2)
             sc = 1368.0 + 45.5 * np.sin((2.0 * np.pi * i / 365.25) + 1.7)
@@ -476,23 +400,21 @@ class MtClim(object):
                 else:
                     dir_flat_topa = -1
 
-                tinystep = (12 * 3600 + h * constants['SECPERRAD']) / \
-                    constants['SRADDT']
-                if (tinystep < 0):
-                    tinystep = 0
-                if (tinystep > tinystepspday - 1):
-                    tinystep = tinystepspday - 1
-                if (dir_flat_topa > 0):
-                    tiny_radfract[i][tinystep] = dir_flat_topa
-                else:
-                    tiny_radfract[i][tinystep] = 0
+                tinystep = np.clip(((12 * 3600 + h * constants['SECPERRAD']) /
+                                    constants['SRADDT']),
+                                   0, self.tinystepspday - 1)
 
-            if (daylength[i] and sum_flat_potrad > 0):
-                tiny_radfract[i] /= sum_flat_potrad
+                if dir_flat_topa > 0:
+                    self.tiny_radfract[i, tinystep] = dir_flat_topa
+                else:
+                    self.tiny_radfract[i, tinystep] = 0
+
+            if daylength[i] and sum_flat_potrad > 0:
+                self.tiny_radfract[i] /= sum_flat_potrad
 
             # calculate maximum daily total transmittance and daylight average
             # flux density for a flat surface and the slope
-            if (daylength[i]):
+            if daylength[i]:
                 ttmax0[i] = sum_trans / sum_flat_potrad
                 flat_potrad[i] = sum_flat_potrad / daylength[i]
                 slope_potrad[i] = sum_slope_potrad / daylength[i]
@@ -507,26 +429,25 @@ class MtClim(object):
         slope_potrad[365] = slope_potrad[364]
         daylength[365] = daylength[364]
 
-        tiny_radfract[365] = tiny_radfract[364]
+        self.tiny_radfract[365] = self.tiny_radfract[364]
 
         # STEP (4)  calculate the sky proportion for diffuse radiation
 
         # uses the product of spherical cap defined by average horizon angle
         # and the great-circle truncation of a hemisphere. this factor does not
         # vary by yearday.
-        avg_horizon = (self.parameters['site_east_horiz'] +
-                       self.parameters['site_west_horiz']) / 2.0
+        avg_horizon = (self.params['site_east_horiz'] +
+                       self.params['site_west_horiz']) / 2.0
         horizon_scalar = 1.0 - np.sin(avg_horizon * constants['RADPERDEG'])
-        if (self.parameters['site_slope'] > avg_horizon):
-            slope_excess = self.parameters['site_slope'] - avg_horizon
+        if (self.params['site_slope'] > avg_horizon):
+            slope_excess = self.params['site_slope'] - avg_horizon
         else:
             slope_excess = 0.
         if (2.0 * avg_horizon > 180.):
             slope_scalar = 0.
         else:
-            slope_scalar = 1.0 - (slope_excess / (180.0 - 2.0 * avg_horizon))
-            if (slope_scalar < 0.):
-                slope_scalar = 0.
+            slope_scalar = np.clip(
+                1.0 - (slope_excess / (180.0 - 2.0 * avg_horizon)), 0, None)
 
         sky_prop = horizon_scalar * slope_scalar
 
@@ -534,16 +455,16 @@ class MtClim(object):
         # calculated once, outside the iteration between radiation and humidity
         # estimates. Requires storing t_fmax in an array.
         # b parameter from 30-day average of DTR
-        b = self.parameters['B0'] + self.parameters['B1'] * \
-            np.exp(-self.parameters['B2'] * sm_dtr)
+        b = self.params['B0'] + self.params['B1'] * \
+            np.exp(-self.params['B2'] * sm_dtr)
 
         # proportion of daily maximum transmittance
-        t_fmax = 1.0 - 0.9 * np.exp(-b * np.power(dtr, self.parameters['C']))
+        t_fmax = 1.0 - 0.9 * np.exp(-b * np.power(dtr, self.params['C']))
 
         # correct for precipitation if this is a rain day
         inds = np.nonzero(self.data['prcp'] >
                           self.options['SW_PREC_THRESH'])[0]
-        t_fmax[inds] *= self.parameters['RAIN_SCALAR']
+        t_fmax[inds] *= self.params['RAIN_SCALAR']
         self.data['s_tfmax'] = t_fmax
 
         # Initial values of vapor pressure, etc
@@ -561,7 +482,7 @@ class MtClim(object):
             pva = svp(tdew)
 
         # Other values needed for srad_humidity calculation
-        pa = atm_pres(self.parameters['site_elev'])
+        pa = atm_pres(self.params['site_elev'])
         yday = self.data.index.dayofyear - 1
         self.data['s_dayl'] = daylength[yday]
         tdew_save = tdew
@@ -596,22 +517,30 @@ class MtClim(object):
             max_iter = 1
 
         # srad-humidity iterations
-        iter_i = 1
+        # iter_i = 1
         rmse_tdew = tol + 1
-        while (rmse_tdew > tol and iter_i < max_iter):
-            tdew_save = tdew[:]
+        # while (rmse_tdew > tol and iter_i < max_iter):
+        #     tdew_save = tdew[:]
+        #
+        #     tdew = self._compute_srad_humidity_onetime(
+        #         tdew, pva, ttmax0, flat_potrad, slope_potrad, sky_prop,
+        #         daylength, parray, pa, dtr)
+        #
+        #     rmse_tdew = rmse(tdew, tdew_save)
+        #     iter_i += 1
 
-            tdew, pva, pet = self._compute_srad_humidity_onetime(
-                tdew, pva, ttmax0, flat_potrad, slope_potrad, sky_prop,
-                daylength, parray, pa, dtr)
-            rmse_tdew = 0
-            for i in range(self.ndays):
-                # use rmse function and vectorize
-                rmse_tdew += (tdew[i] - tdew_save[i]) * \
-                    (tdew[i] - tdew_save[i])
-                rmse_tdew /= self.ndays
-            rmse_tdew = np.power(rmse_tdew, 0.5)
-            iter_i += 1
+        def f(tdew, *args):
+            rmse_tdew = rmse(self._compute_srad_humidity_onetime(tdew, *args),
+                             tdew)
+            return rmse_tdew
+
+        res = minimize_scalar(f, tdew, args=(pva, ttmax0, flat_potrad,
+                                             slope_potrad, sky_prop, daylength,
+                                             parray, pa, dtr),
+                              tol=rmse_tdew, options={'maxiter': max_iter})
+        tdew = res.x
+
+        pva = svp(tdew)
 
         # save humidity in output data structure
         if 's_hum' not in self.data:
@@ -664,7 +593,7 @@ class MtClim(object):
         yday = self.data.index.dayofyear - 1
 
         # Compute SW radiation
-        t_tmax = ttmax0[yday] + (self.parameters['ABASE'] * pva)
+        t_tmax = ttmax0[yday] + (self.params['ABASE'] * pva)
 
         # this is mainly for the case of observed VP supplied, for
         # which t_tmax sometimes ends up being negative (when potential
@@ -675,9 +604,6 @@ class MtClim(object):
 
         # final daily total transmittance
         t_final = t_tmax * self.data['s_tfmax']
-        print(t_tmax)
-        print(self.data['s_tfmax'])
-        assert not np.isnan(t_final.values).any()
 
         # estimate fraction of radiation that is diffuse, on an
         # instantaneous basis, from relationship with daily total
@@ -704,7 +630,7 @@ class MtClim(object):
         # includes the effect of surface albedo in raising the diffuse
         # radiation for obstructed horizons
         srad2 = (flat_potrad[yday] * t_final * pdif) * \
-            (sky_prop + self.parameters['DIF_ALB'] * (1.0 - sky_prop))
+            (sky_prop + self.params['DIF_ALB'] * (1.0 - sky_prop))
 
         # snow pack influence on radiation
         sc = np.zeros_like(self.data['s_swe'])
@@ -721,17 +647,17 @@ class MtClim(object):
 
         # save daily radiation
         # save cloud transmittance when rad is an input
-        if 's_srad' in self.data:
+        if 's_swrad' in self.data:
             potrad = (srad1 + srad2 + sc) * daylength[yday] / t_final / 86400
             self.data['s_tfmax'] = 1.0
-            inds = np.nonzero((potrad > 0.) * (self.data['s_srad'] > 0.) *
+            inds = np.nonzero((potrad > 0.) * (self.data['s_swrad'] > 0.) *
                               (daylength[yday] > 0))[0]
             # both of these are 24hr mean rad. here
-            self.data['s_tfmax'][inds] = (self.data['s_srad'][inds] /
+            self.data['s_tfmax'][inds] = (self.data['s_swrad'][inds] /
                                           (potrad[inds] * t_tmax[inds]))
             self.data['s_tfmax'] = np.maximum(self.data['s_tfmax'], 1.)
         else:
-            self.data['s_srad'] = srad1 + srad2 + sc
+            self.data['s_swrad'] = srad1 + srad2 + sc
 
         if (self.options['LW_CLOUD'].upper() == 'LW_CLOUD_DEARDORFF'):
             self.data['s_tskc'] = (1. - self.data['s_tfmax'])
@@ -741,7 +667,7 @@ class MtClim(object):
 
         # Compute PET using SW radiation estimate, and update Tdew, pva **
         tmink = self.data['s_tmin'] + constants['KELVIN']
-        pet = calc_pet(self.data['s_srad'], self.data['s_tday'], pa,
+        pet = calc_pet(self.data['s_swrad'], self.data['s_tday'], pa,
                        self.data['s_dayl'])
 
         # calculate ratio (PET/effann_prcp) and correct the dewpoint
@@ -749,13 +675,11 @@ class MtClim(object):
         self.data['s_ppratio'] = ratio * 365.25
         tdewk = tmink * (-0.127 + 1.121 *
                          (1.003 - 1.444 * ratio + 12.312 *
-                          np.power(ratio, 2) - 32.766 * np.power(ratio, 3))
-                         + 0.0006 * dtr)
+                          np.power(ratio, 2) - 32.766 * np.power(ratio, 3)) +
+                         0.0006 * dtr)
         tdew = tdewk - constants['KELVIN']
 
-        pva = svp(tdew)
-
-        return tdew, pva, pet
+        return tdew
 
     def calc_longwave(self):
         '''This routine estimates long wave radiation based on the fractional
@@ -793,164 +717,32 @@ class MtClim(object):
             x = 46.5 * vp / air_temp
             emissivity_clear = 1 - (1 + x) * \
                 np.exp(-1 * np.power((1.2 + 3 * x), 0.5))
+        else:
+            raise ValueError('Unknown LW_TYPE {0}'.format(
+                self.options['LW_TYPE']))
 
-        if (self.options['LW_CLOUD'].upper() == 'CLOUD_DEARDORFF'):
+        tskc = self.data['s_tskc']
+
+        if (self.options['LW_CLOUD'].upper() == 'LW_CLOUD_DEARDORFF'):
             # Assume emissivity of clouds is 1.0, and that total emissivity is
             # weighted average of cloud emission plus clear-sky emission,
             # weighted by fraction of sky occupied by each
             # (method of Deardorff, 1978)
-            cloudfrac = self.data['s_tskc']
-            # Deardorff (1978)
-            emissivity = cloudfrac * 1.0 + (1 - cloudfrac) * emissivity_clear
+            emissivity = tskc * 1.0 + (1 - tskc) * emissivity_clear
         else:
             # see Bras 2.43
-            cloudfactor = 1.0 + (0.17 * self.data['s_tskc'] *
-                                 self.data['s_tskc'])
-            emissivity = cloudfactor * emissivity_clear
+            emissivity = (1.0 + (0.17 * tskc * tskc)) * emissivity_clear
 
-        return emissivity * constants['STEFAN_B'] * np.power(air_temp, 4)
+        self.data['s_lwrad'] = (emissivity * constants['STEFAN_B'] *
+                                np.power(air_temp, 4))
 
+    def _calc_trans(self):
+        # STEP (1) calculate pressure ratio (site/reference) = f(elevation)
+        pratio = np.power((1.0 - (constants['LR_STD'] *
+                                  self.params['site_elev']) /
+                           constants['T_STD']),
+                          (constants['G_STD'] / (constants['LR_STD'] *
+                           (constants['R'] / constants['MA']))))
 
-def calc_pet(rad, ta, pa, dayl, dt=0.2):
-    '''
-    calculates the potential evapotranspiration for aridity corrections in
-    `calc_vpd()`, according to Kimball et al., 1997
-
-    Parameters
-    ----------
-    rad : scalar or numpy.ndarray
-        daylight average incident shortwave radiation (W/m2)
-    ta : scalar or numpy.ndarray
-        daylight average air temperature (deg C)
-    pa : scalar or numpy.ndarray
-        air pressure (Pa)
-    dayl : scalar or numpy.ndarray
-        daylength (s)
-    dt : scalar, optional
-        offset for saturation vapor pressure calculation, default = 0.2
-
-    Returns
-    ----------
-    pet : scalar or numpy.ndarray
-        Potential evapotranspiration (cm/day)
-    '''
-    # rnet       # (W m-2) absorbed shortwave radiation avail. for ET
-    # lhvap      # (J kg-1) latent heat of vaporization of water
-    # gamma      # (Pa K-1) psychrometer parameter
-    # dt = 0.2   # offset for saturation vapor pressure calculation
-    # t1, t2     # (deg C) air temperatures
-    # pvs1, pvs2 # (Pa)   saturated vapor pressures
-    # pet        # (kg m-2 day-1) potential evapotranspiration
-    # s          # (Pa K-1) slope of saturated vapor pressure curve
-
-    # calculate absorbed radiation, assuming albedo = 0.2  and ground
-    # heat flux = 10% of absorbed radiation during daylight
-    rnet = rad * 0.72
-
-    # calculate latent heat of vaporization as a function of ta
-    lhvap = 2.5023e6 - 2430.54 * ta
-
-    # calculate the psychrometer parameter: gamma = (cp pa)/(lhvap epsilon)
-    # where:
-    # cp       (J/kg K)   specific heat of air
-    # epsilon  (unitless) ratio of molecular weights of water and air
-    gamma = constants['CP'] * pa / (lhvap * constants['EPS'])
-
-    # estimate the slope of the saturation vapor pressure curve at ta
-    # temperature offsets for slope estimate
-    t1 = ta + dt
-    t2 = ta - dt
-
-    # calculate saturation vapor pressures at t1 and t2, using formula from
-    # Abbott, P.F., and R.C. Tabony, 1985. The estimation of humidity
-    # parameters. Meteorol. Mag., 114:49-56.
-    pvs1 = svp(t1)
-    pvs2 = svp(t2)
-
-    # calculate slope of pvs vs. T curve near ta
-    s = (pvs1 - pvs2) / (t1 - t2)
-    # can this be s = svp_slope(ta)? JJH
-
-    # calculate PET using Priestly-Taylor approximation, with coefficient
-    # set at 1.26. Units of result are kg/m^2/day, equivalent to mm water/day
-    pet = (1.26 * (s / (s + gamma)) * rnet * dayl) / lhvap
-
-    # return a value in centimeters/day, because this value is used in a ratio
-    # to annual total precip, and precip units are centimeters
-    return (pet / 10.)
-
-
-def atm_pres(elev):
-    '''atmospheric pressure (Pa) as a function of elevation (m)
-
-    Parameters
-    ----------
-    elev : scalar or numpy.ndarray
-        Elevation (meters)
-
-    Returns
-    -------
-    pressure : scalar or numpy.ndarray
-        Atmospheric pressure at elevation `elev` (Pa)
-
-    References
-    ----------
-    * Iribane, J.V., and W.L. Godson, 1981. Atmospheric Thermodynamics, 2nd
-      Edition. D. Reidel Publishing Company, Dordrecht, The Netherlands.
-      (p. 168)
-    '''
-    t1 = 1.0 - (constants['LR_STD'] * elev) / constants['T_STD']
-    t2 = constants['G_STD'] / (constants['LR_STD'] * (constants['R'] /
-                                                      constants['MA']))
-
-    return constants['P_STD'] * np.power(t1, t2)
-
-
-def svp(temp, a=0.61078, b=17.269, c=237.3):
-    '''Compute the saturated vapor pressure.
-
-    Parameters
-    ----------
-    temp : numpy.ndarray
-        Temperature (degrees Celsius)
-
-    Returns
-    ----------
-    pressure : numpy.ndarray
-        Saturated vapor pressure at temperature `temp` (Pa)
-
-    References
-    ----------
-    * Maidment, David R. Handbook of hydrology. McGraw-Hill Inc., 1992.
-      Equation 4.2.2.
-    '''
-
-    svp = a * np.exp((b * temp) / (c + temp))
-
-    inds = np.nonzero(temp < 0.)[0]
-    svp[inds] *= 1.0 + .00972 * temp[inds] + .000042 * np.power(temp[inds], 2)
-
-    return svp * 1000.
-
-
-def svp_slope(temp, a=0.61078, b=17.269, c=237.3):
-    '''Compute the gradient of the saturated vapor pressure as a function of
-    temperature.
-
-    Parameters
-    ----------
-    temp : numpy.ndarray
-        Temperature (degrees Celsius)
-
-    Returns
-    -------
-    gradient : numpy.ndarray
-        Gradient of d(svp)/dT.
-
-    References
-    ----------
-    * Maidment, David R. Handbook of hydrology. McGraw-Hill Inc., 1992.
-      Equation 4.2.3.
-    '''
-
-    return (b * c) / ((c + temp) * (c + temp)) * svp(temp, a=a, b=b, c=c)
+        # STEP (2) correct initial transmittance for elevation
+        return np.power(self.params['TBASE'], pratio)

@@ -10,4 +10,5 @@ setup(name='mtclim',
       description='The University of Montana Mountain Climate Simulator',
       author='Joe Hamman',
       author_email='jhamman@hydro.washington.edu',
-      packages=['mtclim'])
+      packages=['mtclim'],
+      tests_require=['pytest', 'engarde'])

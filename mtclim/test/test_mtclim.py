@@ -2,8 +2,41 @@ import pytest
 import pandas as pd
 import numpy as np
 from io import StringIO
-
+import engarde.checks as ec
 from mtclim.mtclim import MtClim, atm_pres, svp, svp_slope, calc_pet
+
+
+dtypes = dict(tmax=float, tmin=float, prcp=float, s_tmax=float, s_tmin=float,
+              s_tday=float, s_prcp=float, s_tfmax=float, s_swe=float,
+              s_srad=float)
+ranges = dict(tmax=(-100, 100), tmin=(-100, 100), prcp=(0, None),
+              s_tmax=(-100, 100), s_tmin=(-100, 100), s_tday=(-100, 100),
+              s_prcp=(0, None), s_tfmax=(0, 1), s_swe=(0, None),
+              s_srad=(0, None), s_lwrad=(0, None))
+
+
+def check(data, ranges=ranges, dtypes=dtypes):
+    ec.unique_index(data)
+    ec.none_missing(data)
+    ec.within_range(data, items=ranges)
+    ec.has_dtypes(data, items=dtypes)
+
+
+def check_hourly_temp(htemp, dtemps):
+    def check(df):
+        r = (df.htmax <= df.dtmax | df.htmin >= df.dtmin)
+        return r
+
+    df = pd.DataFrame({'htmax': htemp.resample('D', how='max'),
+                       'htmin': htemp.resample('D', how='min'),
+                       'dtmax': dtemps.tmax,
+                       'dtmin': dtemps.tmin})
+    ec.verify_all(df, check)
+
+
+def precip_disagg():
+    '''daily, montly, and annual precip matches inputs'''
+    pass
 
 
 @pytest.fixture()
@@ -107,6 +140,7 @@ def test_simple_snowpack(short_daily_dataframe):
     m.data['s_swe'] = 0.
     m._simple_snowpack(100)
     assert (m.data['s_swe'] >= 0.).all()
+    # TODO - different results when snowpack starts is 0/nonzero
 
 
 def test_atm_pres():
